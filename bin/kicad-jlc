@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+kicad-jlc
+Zero-argument KiCad 9 -> JLCPCB fabrication/assembly exporter.
+
+Run from a KiCad project directory containing exactly one *.kicad_pro.
+Requires: python3, kicad-cli
+
+Project convention:
+    Schematic field containing the JLC/LCSC part number: JLCPCB_PN
+
+Output:
+    fab/<project>-gerbers.zip
+    fab/<project>-BOM.csv
+    fab/<project>-CPL.csv
+    fab/<project>-DRC.rpt
+    fab/<project>-schematic.pdf
+    fab/<project>-assembly-omitted.txt   (only if applicable)
+"""
+
+from __future__ import annotations
+
+import csv
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from collections import defaultdict
+from pathlib import Path
+
+JLC_FIELD = "JLCPCB_PN"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd: list[str], *, allow_drc_violations: bool = False) -> subprocess.CompletedProcess:
+    print("+", " ".join(str(x) for x in cmd))
+    p = subprocess.run(cmd)
+    if p.returncode != 0:
+        if allow_drc_violations and p.returncode == 5:
+            return p
+        die(f"command failed with exit code {p.returncode}: {' '.join(cmd)}", p.returncode)
+    return p
+
+
+def natural_ref_key(ref: str):
+    parts = re.split(r"(\d+)", ref)
+    return tuple(int(p) if p.isdigit() else p for p in parts)
+
+
+def split_refs(s: str) -> list[str]:
+    # We request an ungrouped BOM, but handle comma-separated refs defensively.
+    return [r.strip() for r in s.split(",") if r.strip()]
+
+
+def gerber_layers_from_pcb(pcb: Path) -> list[str]:
+    """
+    Read the enabled KiCad board layers and return the fabrication layers:
+    all copper + soldermask + silkscreen + board outline.
+    """
+    text = pcb.read_text(errors="replace")
+
+    m = re.search(r"\(layers\s*(.*?)\n\s*\)", text, flags=re.S)
+    if not m:
+        die("could not parse the (layers ...) section from the PCB")
+
+    block = m.group(1)
+    entries = re.findall(r'\(\d+\s+"([^"]+)"\s+([^) \n]+)', block)
+
+    copper = [name for name, kind in entries if kind == "signal" and name.endswith(".Cu")]
+    present = {name for name, _ in entries}
+
+    if not copper:
+        die("no copper layers found in PCB")
+
+    extras = ["F.Mask", "B.Mask", "F.SilkS", "B.SilkS", "Edge.Cuts"]
+    return copper + [x for x in extras if x in present]
+
+
+def make_jlc_bom(raw_bom: Path, out_bom: Path) -> tuple[set[str], list[str]]:
+    with raw_bom.open(newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    required = {"Reference", "Value", "Footprint", JLC_FIELD}
+    if not rows:
+        die("KiCad BOM export was empty")
+    missing_cols = required - set(rows[0].keys())
+    if missing_cols:
+        die(f"raw BOM is missing expected columns: {', '.join(sorted(missing_cols))}")
+
+    # Group by actual assembly identity.
+    grouped: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+    omitted: list[str] = []
+    assembly_refs: set[str] = set()
+
+    for row in rows:
+        refs = split_refs(row["Reference"])
+        pn = row[JLC_FIELD].strip()
+        value = row["Value"].strip()
+        footprint = row["Footprint"].strip()
+
+        if not pn:
+            omitted.extend(refs)
+            continue
+
+        key = (value, footprint, pn)
+        grouped[key].extend(refs)
+        assembly_refs.update(refs)
+
+    if not assembly_refs:
+        die(
+            f"no components had a populated {JLC_FIELD} field. "
+            f"Populate that field for parts JLC should assemble."
+        )
+
+    with out_bom.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        # JLC-recognized standard headers.
+        w.writerow(["Comment", "Designator", "Footprint", "LCSC Part #"])
+
+        items = sorted(
+            grouped.items(),
+            key=lambda kv: natural_ref_key(sorted(kv[1], key=natural_ref_key)[0]),
+        )
+        for (value, footprint, pn), refs in items:
+            refs = sorted(refs, key=natural_ref_key)
+            w.writerow([value, ",".join(refs), footprint, pn])
+
+    return assembly_refs, sorted(set(omitted), key=natural_ref_key)
+
+
+def make_jlc_cpl(raw_cpl: Path, out_cpl: Path, assembly_refs: set[str]) -> None:
+    with raw_cpl.open(newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    required = {"Ref", "PosX", "PosY", "Rot", "Side"}
+    if not rows:
+        die("KiCad position export was empty")
+    missing_cols = required - set(rows[0].keys())
+    if missing_cols:
+        die(f"raw CPL is missing expected columns: {', '.join(sorted(missing_cols))}")
+
+    by_ref = {row["Ref"].strip(): row for row in rows}
+    missing = sorted(assembly_refs - set(by_ref), key=natural_ref_key)
+    if missing:
+        die(
+            "components in the JLC BOM are missing from the placement file: "
+            + ", ".join(missing)
+        )
+
+    with out_cpl.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Designator", "Mid X", "Mid Y", "Rotation", "Layer"])
+
+        for ref in sorted(assembly_refs, key=natural_ref_key):
+            row = by_ref[ref]
+            side = row["Side"].strip().lower()
+
+            if side in ("front", "top"):
+                layer = "Top"
+            elif side in ("back", "bottom"):
+                layer = "Bottom"
+            else:
+                die(f"unexpected KiCad side '{row['Side']}' for {ref}")
+
+            w.writerow([
+                ref,
+                row["PosX"].strip(),
+                row["PosY"].strip(),
+                row["Rot"].strip(),
+                layer,
+            ])
+
+
+def main() -> None:
+    if shutil.which("kicad-cli") is None:
+        die("kicad-cli is not in PATH")
+
+    cwd = Path.cwd()
+    projects = sorted(cwd.glob("*.kicad_pro"))
+    if len(projects) != 1:
+        die(f"expected exactly one *.kicad_pro in {cwd}; found {len(projects)}")
+
+    pro = projects[0]
+    stem = pro.stem
+    pcb = cwd / f"{stem}.kicad_pcb"
+    sch = cwd / f"{stem}.kicad_sch"
+
+    if not pcb.is_file():
+        die(f"missing {pcb.name}")
+    if not sch.is_file():
+        die(f"missing {sch.name}")
+
+    out = cwd / "fab"
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir()
+
+    drc = out / f"{stem}-DRC.rpt"
+    schematic_pdf = out / f"{stem}-schematic.pdf"
+    bom = out / f"{stem}-BOM.csv"
+    cpl = out / f"{stem}-CPL.csv"
+    gerber_zip = out / f"{stem}-gerbers.zip"
+
+    with tempfile.TemporaryDirectory(prefix=f"{stem}-fab-") as td:
+        tmp = Path(td)
+        gerbers = tmp / "gerbers"
+        gerbers.mkdir()
+        raw_bom = tmp / "raw-bom.csv"
+        raw_cpl = tmp / "raw-cpl.csv"
+
+        # Stop immediately if the board has any non-excluded DRC violation.
+        drc_result = run([
+            "kicad-cli", "pcb", "drc",
+            "--exit-code-violations",
+            "--output", str(drc),
+            str(pcb),
+        ], allow_drc_violations=True)
+        if drc_result.returncode == 5:
+            die(f"DRC has violations; see {drc}")
+
+        layers = gerber_layers_from_pcb(pcb)
+        print("Gerber layers:", ", ".join(layers))
+
+        run([
+            "kicad-cli", "pcb", "export", "gerbers",
+            "--output", str(gerbers),
+            "--layers", ",".join(layers),
+            str(pcb),
+        ])
+
+        run([
+            "kicad-cli", "pcb", "export", "drill",
+            "--output", str(gerbers),
+            str(pcb),
+        ])
+
+        run([
+            "kicad-cli", "pcb", "export", "pos",
+            "--format", "csv",
+            "--units", "mm",
+            "--side", "both",
+            "--exclude-dnp",
+            "--output", str(raw_cpl),
+            str(pcb),
+        ])
+
+        # Export one row per symbol; this script does the JLC grouping.
+        run([
+            "kicad-cli", "sch", "export", "bom",
+            "--fields", f"Reference,Value,Footprint,{JLC_FIELD}",
+            "--labels", f"Reference,Value,Footprint,{JLC_FIELD}",
+            "--exclude-dnp",
+            "--output", str(raw_bom),
+            str(sch),
+        ])
+
+        run([
+            "kicad-cli", "sch", "export", "pdf",
+            "--output", str(schematic_pdf),
+            str(sch),
+        ])
+
+        assembly_refs, omitted = make_jlc_bom(raw_bom, bom)
+        make_jlc_cpl(raw_cpl, cpl, assembly_refs)
+
+        gerber_files = [p for p in gerbers.iterdir() if p.is_file()]
+        if not gerber_files:
+            die("Gerber/drill export produced no files")
+
+        with zipfile.ZipFile(gerber_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(gerber_files):
+                z.write(p, arcname=p.name)
+
+    if omitted:
+        omitted_file = out / f"{stem}-assembly-omitted.txt"
+        omitted_file.write_text(
+            "These non-DNP BOM components have no JLCPCB_PN and were therefore\n"
+            "omitted from the JLC BOM/CPL. Verify that they are intentionally\n"
+            "hand-assembled or otherwise not part of JLC assembly:\n\n"
+            + "\n".join(omitted)
+            + "\n"
+        )
+
+    print("\nReady for JLCPCB:")
+    for p in sorted(out.iterdir()):
+        if p.is_file():
+            print(f"  {p.name}")
+
+    print(f"\nAssembly components: {len(assembly_refs)}")
+    if omitted:
+        print(f"Omitted (no {JLC_FIELD}): {len(omitted)}")
+        print(f"Review: {stem}-assembly-omitted.txt")
+
+
+if __name__ == "__main__":
+    main()

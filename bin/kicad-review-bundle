@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+proj_dir="$(pwd)"
+proj_name="$(basename "$proj_dir")"
+out_dir="${proj_name}_review"
+out_zip="${out_dir}.zip"
+
+rm -rf "$out_dir" "$out_zip"
+mkdir -p "$out_dir"
+
+copy_if_present() {
+    local file="$1"
+    [ -f "$file" ] && cp "$file" "$out_dir/"
+}
+
+# Core KiCad project files
+for f in ./*.kicad_pro ./*.kicad_pcb ./*.kicad_sch; do
+    [ -e "$f" ] || continue
+    [[ "$(basename "$f")" == _autosave-* ]] && continue
+    cp "$f" "$out_dir/"
+done
+
+# BOM / CSV exports
+for f in ./*.csv; do
+    [ -e "$f" ] && cp "$f" "$out_dir/"
+done
+
+# DRC reports
+for f in ./*drc*.rpt ./*DRC*.rpt ./*drc*.txt ./*DRC*.txt; do
+    [ -e "$f" ] && cp "$f" "$out_dir/"
+done
+
+# ERC reports
+for f in ./*erc*.rpt ./*ERC*.rpt ./*erc*.txt ./*DRC*.txt; do
+    [ -e "$f" ] && cp "$f" "$out_dir/"
+done
+
+# PDFs, typically schematic exports
+for dir in . ./artifacts; do
+    [ -d "$dir" ] || continue
+
+    for f in "$dir"/*.pdf; do
+        [ -e "$f" ] && cp "$f" "$out_dir/"
+    done
+done
+
+# Optional mechanical models
+# Search a few levels down because custom STEP files are often insubdirectories.
+find . -maxdepth 3 -type f \( \
+    -iname '*.step' -o \
+    -iname '*.stp' \
+\) \
+    -not -path "./${out_dir}/*" \
+    -exec cp -n {} "$out_dir/" \;
+
+zip -qr "$out_zip" "$out_dir"
+
+echo "Created: $proj_dir/$out_zip"
+echo
+echo "Included:"
+find "$out_dir" -maxdepth 1 -type f -printf '  %f\n' | sort
